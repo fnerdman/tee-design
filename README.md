@@ -73,6 +73,80 @@ A governance body that decides on workload identities, and must have multiple fl
 
 Likewise for the data availability of these measurements, a production system needs a strong mechanism in place that secures the DA. The chain is usually the obvious answer for web3 projects.
 
+# TEE Provisioning: Bridging Static Trust and Dynamic Configuration
+
+## What is TEE Provisioning?
+
+TEE provisioning addresses the fundamental tension between attestable determinism and operational flexibility. While TEEs derive trustworthiness from predictable, measurable boot processes, real-world applications require dynamic loading of secrets configuration data or even complete workloads including container files and binaries (as seen with CoCo/Dstack).
+
+Consider a confidential microservice that needs to connect to different databases based on environment, enable customer-specific features, or rotate encryption keys without redeployment. Traditional configuration approaches would break TEE security guarantees, but proper provisioning maintains both flexibility and verifiable integrity.
+
+The challenge lies in extending the TEE's trusted computing base to include dynamically loaded content while preserving the attestability that makes TEEs trustworthy in the first place.
+
+## Config and Workload Provisioning
+
+Config and workload provisioning involves securely loading and validating dynamic content into a TEE while maintaining attestability. Since measurement registers and attestation fields are limited to hash-sized values, the dynamically loaded content is represented as cryptographic hashes throughout both approaches described below. While we use the term "config provisioning" throughout this document for brevity, the scope extends far beyond simple configuration files to include complete workloads, container images, application binaries, and entire runtime environments - as seen in systems like CoCo and Dstack where the base image is minimal and the actual application is loaded dynamically post-boot.
+
+### Approach 1: Measurement Extension
+
+In this approach, configuration content is loaded dynamically and then cryptographically recorded in the TEE's measurement registers. Verifiers must understand the extension logic to validate the final state.
+
+**Process Flow:**
+1. TEE loads configuration from external source
+2. Configuration is validated against security policies
+3. Configuration hash is extended into measurement register (PCR/RTMR)
+4. Attestation quote reflects the extended measurements
+5. Verifiers validate both base measurements and extension sequence
+
+```rust
+// Conceptual measurement extension
+extend_pcr(config_pcr, sha256(config_bytes))
+```
+
+**AMD SEV-SNP specifics:**
+
+- uses a vTPM with PCRs to record application/runtime measurements; reserve PCRs (e.g., 10–15) for app-level use when feasible
+- Extension function: `PCR[i] = SHA256(PCR[i] || value)` where `value` is a digest of a canonicalized configuration manifest (prefer manifest-over-file-by-file to avoid ordering/whitespace pitfalls)
+- Prefer extending a single, canonical manifest hash rather than many small items to simplify verification and avoid ambiguous sequences
+
+**Intel TDX specifics:**
+
+- Runtime Measurement Registers `RTMR[0..3]` are available for runtime content. `RTMR[3]` is dedicated to extend measurements after boot. The extendability of `RTMR[0]..[2]` post-boot is restricted
+- Extension function: `RTMR[i] = SHA384(RTMR[i] || value)` where `value` is a digest of a canonicalized configuration manifest
+- A direct mapping exists between TPM PCRs and TDX RTMRs for compatibility with existing tooling
+
+### Approach 2: Pre-defined Configuration Validation
+
+Valid configuration hashes are embedded in the TEE at build time or provided through operator-defined attestation values. The provisioning process validates configuration against these pre-defined values rather than extending measurements.
+
+**Process Flow:**
+1. Expected configuration hash is set during deployment (MRCONFIGID, HOSTDATA)
+2. TEE receives configuration from external source
+3. Configuration is hashed using deterministic algorithm
+4. Hash is compared against value in attestation quote
+5. Configuration is applied only if validation succeeds
+
+```rust
+// Conceptual pre-validation
+if sha256(provided_config) == attestation_quote.mrconfigid {
+    apply_config(provided_config)
+}
+```
+
+**Intel TDX specifics:** `MRCONFIGID` can be set by the platform/VMM at TD creation to pin an expected configuration hash (e.g., hash of a signed config bundle/manifest). This enables a simple compare inside the TEE. Additional related identity/configuration fields include `MROWNER` (platform/owner identity) and `MROWNERCONFIG` (owner-provided configuration identity). Base measurement `MRTD` and runtime measurements `RTMR[0..3]` are part of the report. These fields are established by the platform/VMM and are not modifiable by the guest runtime.
+
+**AMD SEV-SNP specifics:** `HOST_DATA` can be provided by the platform at VM launch to carry an expected configuration hash for comparison.
+
+### Key Considerations and Trade-offs
+
+**Platform Availability Limitations:** Availability of these features is cloud-/platform-dependent. Some cloud providers do not expose tenant control over `HOST_DATA` (or over TDX `MRCONFIGID`). In such environments, prefer the measurement-extension approach.
+
+**Caution on REPORTDATA/REPORT_DATA:** Both TDX `REPORTDATA` and AMD SEV-SNP `REPORT_DATA` are guest-controlled fields intended for binding ephemeral, runtime-provided data into a report. Because they are writable by the running workload, they must not be used to validate configuration provenance or to gate configuration application. Using these fields for configuration validation can be exploited by a compromised runtime.
+
+**Measurement extension** provides maximum flexibility but complicates verification since attestation consumers must understand the exact sequence of measurement extensions. This approach is straightforward and can be understood well, but comes with the added hassle of having to deal with extending measurements and a more complicated attestation verification process that needs to be aware of measurement extension logic. This approach suits dynamic environments where configuration changes frequently.
+
+**Pre-defined validation** trades flexibility for simplicity, requiring configuration approval at deployment time but enabling straightforward verification through single hash comparison. The second approach is more difficult to grasp conceptually but simplifies the verification process. This approach aligns with production environments where configuration changes follow formal approval processes.
+
 # CVM Maintenance Access and Runtime Modifications
 
 ## The Determinism Challenge
