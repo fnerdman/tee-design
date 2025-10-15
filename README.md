@@ -137,6 +137,11 @@ if sha256(provided_config) == attestation_quote.mrconfigid {
 
 **AMD SEV-SNP specifics:** `HOST_DATA` can be provided by the platform at VM launch to carry an expected configuration hash for comparison.
 
+### How to provision?
+
+- by default, TEEs come with a provisioning API endpoint that can be used to serve provisining config to the TEE
+- the cloudinit spec defines a standardized ways of serving configuration to VMs, it can be used to serve configuration to the TEE without a networked API endpoint
+
 ### Key Considerations and Trade-offs
 
 **Platform Availability Limitations:** Availability of these features is cloud-/platform-dependent. Some cloud providers do not expose tenant control over `HOST_DATA` (or over TDX `MRCONFIGID`). In such environments, prefer the measurement-extension approach.
@@ -146,6 +151,46 @@ if sha256(provided_config) == attestation_quote.mrconfigid {
 **Measurement extension** provides maximum flexibility but complicates verification since attestation consumers must understand the exact sequence of measurement extensions. This approach is straightforward and can be understood well, but comes with the added hassle of having to deal with extending measurements and a more complicated attestation verification process that needs to be aware of measurement extension logic. This approach suits dynamic environments where configuration changes frequently.
 
 **Pre-defined validation** trades flexibility for simplicity, requiring configuration approval at deployment time but enabling straightforward verification through single hash comparison. The second approach is more difficult to grasp conceptually but simplifies the verification process. This approach aligns with production environments where configuration changes follow formal approval processes.
+
+## Secret provisioning
+
+Secrets by definition shouldn't be known to all participants and therefore must not be part of the measurements. That’s good news but more bad news.
+
+- Easier: no need to extend RTMR/PCR with secret material.
+- Harder: we must first attest the TEE and only then deliver secrets over a secure, attested channel so nothing leaks.
+
+One should distinguish between two types of secrets to provision:
+
+1. Secret seed (persistence-enabler)
+   A single high-entropy seed from which the workload deterministically derives instance keys (TLS, storage, feature flags). This seed must come from a trusted source — ideally a KMS or coordinator running in a TEE — otherwise the whole security story is undercut.
+2. Externally provided runtime secrets
+   Non-derivable inputs needed by the workload (API tokens, OAuth creds, tenant keys). These are scoped and rotated, and usually come from the data owner or an external KMS.
+
+### How to provision?
+
+- attested TLS (aTLS) is considered the industry standard for achieving secure and attested communication through which secrets can be communicated
+- due to to handshake nature, we can't transfer secrets over a unidirectional channel such as cloudinit, it needs an API like interface into the enclave
+- theres also a pull alternative, where the TEE attests to an external vault and then requests the secrets from it
+
+
+### Key Considerations
+
+**Proving possesion of secrets:** Sometimes you need to prove the TEE “has the right secret.” Don’t measure the secret. Instead, design provisioning so the enclave only continues if the provided secret is correct (e.g., gate readiness on successful secret load/verification).
+
+**Implementation complexity of secret persistence:** There’s a chicken-and-egg when using a seed: you want to transfer it over a secure, attested channel, but the usual service keys are derived from that seed, thus requiring an additional attested authentication step using ephemeral keys.
+
+
+## Defining the Static-Dynamic Split
+
+An important decisions in TEE provisioning is determining where to draw the line between what gets included in the base image versus what gets loaded dynamically after startup. This boundary directly impacts both security properties and operational flexibility.
+
+The use case requirements typically define this line. At one extreme are security-critical applications with minimal TCB requirements, where almost everything except dynamic application configuration is included in the base image. This approach leverages the more sophisticated and battle-tested boot-time measurement process - the Linux boot measurement into TPM represents a well-established attack surface that extends far beyond TEEs and has been hardened over many years. In contrast, measurement logic implemented by specific TEE projects with limited adoption presents a narrower but potentially less mature attack surface. However, this static approach significantly reduces runtime flexibility, making it difficult to adapt to different environments or update configurations without rebuilding and redeploying the entire base image.
+
+At the other extreme are containerization systems like CoCo and Dstack, where the base image includes only the essential containerization stack. The actual workload - including application configuration, binaries, and runtime dependencies - is entirely dependent on dynamically loaded content after startup. This maximizes flexibility but requires sophisticated provisioning mechanisms to maintain security guarantees.
+
+Between these extremes lie various hybrid approaches where core application logic resides in the base image while configuration data, feature flags, and environment-specific parameters are provisioned dynamically.
+
+No universal recommendations can be made for this boundary - the use case itself defines what should be part of the base image versus what requires dynamic provisioning. The decision involves balancing attestation complexity, deployment flexibility, security requirements, and operational constraints.
 
 # CVM Maintenance Access and Runtime Modifications
 
